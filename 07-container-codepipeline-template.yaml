@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  # VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  VPCInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: ap-southeast-1a
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: ap-southeast-1b
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+  InternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      GatewayId: !Ref InternetGateway
+      DestinationCidrBlock: 0.0.0.0/0
+  # Web server
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow all HTTP traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+  # Container
+  WebServerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+  WebServerLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+  WebServerLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebServerLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerLoadBalancerTargetGroup
+  WebServerContainerCluster:
+    Type: AWS::ECS::Cluster
+  WebServerContainerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: WebServer
+          Image: nginx
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogGroup
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: nginx
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: 256
+      Memory: 512
+      ExecutionRoleArn: !Sub ${WebServerContainerExecutionServerRole.Arn}
+  WebServerContainerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref WebServerContainerCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref WebServerContainerTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref WebServerSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet
+      LoadBalancers:
+        - ContainerName: WebServer
+          ContainerPort: 80
+          TargetGroupArn: !Ref WebServerLoadBalancerTargetGroup
+    DependsOn: WebServerLoadBalancerHttpListener
+  WebServerContainerExecutionServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: WebServerContainerExecutionServiceRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !Sub ${CloudWatchLogGroup.Arn}
+                Action: logs:*
+              - Resource: !Sub ${CodePipelineContainerRegistry.Arn}
+                Action: ecr:*
+                Effect: Allow
+              - Resource: "*"
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                Effect: Allow
+  # Cloud watch
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 3
+  # Code pipeline
+  CodePipelineContainerRegistry:
+    Type: AWS::ECR::Repository
+  CodePipelineBucket:
+    Type: AWS::S3::Bucket
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Resource:
+                  - !Sub ${CodePipelineBucket.Arn}
+                  - !Sub ${CodePipelineBucket.Arn}/*
+                Action: s3:*
+                Effect: Allow
+              - Resource: !Sub ${CodePipelineContainerRegistry.Arn}
+                Action: ecr:*
+                Effect: Allow
+              - Resource: "*"
+                Action: ecr:GetAuthorizationToken
+                Effect: Allow
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !Ref CodeBuildServiceRole
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                docker: 19
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws --version
+                - $(aws ecr get-login --region ${AWS::Region} --no-include-email)
+                - REPOSITORY_URI=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${CodePipelineContainerRegistry}
+                - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - IMAGE_TAG=${!COMMIT_HASH:=latest}
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - cd write-it-down-web
+                - npm install
+                - npm run build
+                - |
+                    cat > Dockerfile <<EOF
+                    FROM nginx
+                    COPY build /usr/share/nginx/html/
+                    EOF
+                - docker build -t $REPOSITORY_URI:latest .
+                - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker images...
+                - docker push $REPOSITORY_URI:latest
+                - docker push $REPOSITORY_URI:$IMAGE_TAG
+                - echo Writing image definitions file...
+                - printf '[{"name":"WebServer","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+          artifacts:
+            files: imagedefinitions.json
+            base-directory: write-it-down-web
+      LogsConfig:
+        CloudWatchLogs:
+          Status: DISABLED
+        S3Logs:
+          Status: ENABLED
+          Location: !Sub ${CodePipelineBucket.Arn}/BuildLogs
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Resource: !Sub ${SourceCodeConnectionArn}
+                Action: codestar-connections:UseConnection
+                Effect: Allow
+              - Resource: !Sub ${CodePipelineBucket.Arn}/*
+                Action: s3:*
+                Effect: Allow
+              - Resource: !Sub ${CodeBuildProject.Arn}
+                Action: codebuild:*
+                Effect: Allow
+              - Resource: !Sub ${WebServerContainerExecutionServerRole.Arn}
+                Action: iam:PassRole
+                Effect: Allow
+              - Resource:
+                  - !Sub ${WebServerContainerCluster.Arn}
+                  - !Ref WebServerContainerService
+                Action: ecs:*
+                Effect: Allow
+              - Resource: "*"
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                Effect: Allow
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !Sub ${CodePipelineServiceRole.Arn}
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineBucket
+      RestartExecutionOnUpdate: true
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Default
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ConnectionArn: !Sub ${SourceCodeConnectionArn}
+                FullRepositoryId: !Sub ${SourceCodeRepository}
+                BranchName: master
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Build
+          Actions:
+            - Name: Default
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+        - Name: Deploy
+          Actions:
+            - Name: Default
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: "1"
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ClusterName: !Ref WebServerContainerCluster
+                ServiceName: !Ref WebServerContainerService
+Parameters:
+  SourceCodeConnectionArn:
+    Type: String
+    Default: arn:aws:codestar-connections:ap-southeast-1:658240618267:connection/3d22818a-be97-4fbb-9ca4-aaf97eab4612
+  SourceCodeRepository:
+    Type: String
+    Default: chimin/write-it-down
+Outputs:
+  Url:
+    Description: URL of the web server instance
+    Value: !Sub http://${WebServerLoadBalancer.DNSName}

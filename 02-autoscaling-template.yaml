@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  # VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  VPCInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: ap-southeast-1a
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: ap-southeast-1b
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+  InternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      GatewayId: !Ref InternetGateway
+      DestinationCidrBlock: 0.0.0.0/0
+  # Web server
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow all HTTP traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: TCP
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Sub ${SshAllowCidrIp}
+  # Auto scaling
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0d728fd4e52be968f
+        InstanceType: t2.micro
+        NetworkInterfaces:
+          - DeviceIndex: "0"
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref WebServerSecurityGroup
+        KeyName: !Sub ${SshKeyName}
+        UserData: !Base64 |
+          #!/usr/bin/env bash
+          sudo yum update -y
+          sudo amazon-linux-extras install -y nginx1
+          sudo systemctl enable nginx
+          sudo systemctl start nginx
+    DependsOn: InternetRoute
+  WebServerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+  WebServerLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+  WebServerLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebServerLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerLoadBalancerTargetGroup
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        Version: !Sub ${WebServerLaunchTemplate.LatestVersionNumber}
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+      MinSize: 1
+      MaxSize: 2
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      TargetGroupARNs:
+        - !Ref WebServerLoadBalancerTargetGroup
+Parameters:
+  SshAllowCidrIp:
+    Type: String
+    Default: 0.0.0.0/0
+  SshKeyName:
+    Type: String
+    Default: chimin
+Outputs:
+  Url:
+    Description: URL of the web server instance
+    Value: !Sub http://${WebServerLoadBalancer.DNSName}

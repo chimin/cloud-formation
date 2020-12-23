@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  # VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  VPCInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref VPC
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+  InternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      GatewayId: !Ref InternetGateway
+      DestinationCidrBlock: 0.0.0.0/0
+  # Web server
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow all HTTP traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: TCP
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Sub ${SshAllowCidrIp}
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0d728fd4e52be968f
+      InstanceType: t2.micro
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref PublicSubnet
+          AssociatePublicIpAddress: true
+          GroupSet:
+            - !Ref WebServerSecurityGroup
+      KeyName: !Sub ${SshKeyName}
+      UserData: !Base64 |
+        #!/usr/bin/env bash
+        sudo yum update -y
+        sudo amazon-linux-extras install -y nginx1
+        sudo systemctl enable nginx
+        sudo systemctl start nginx
+    DependsOn: InternetRoute
+Parameters:
+  SshAllowCidrIp:
+    Type: String
+    Default: 0.0.0.0/0
+  SshKeyName:
+    Type: String
+    Default: chimin
+Outputs:
+  Url:
+    Description: URL of the web server instance
+    Value: !Sub http://${WebServerInstance.PublicIp}

@@ -1,0 +1,493 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  # VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  VPCInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: ap-southeast-1a
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: ap-southeast-1b
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+  InternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      GatewayId: !Ref InternetGateway
+      DestinationCidrBlock: 0.0.0.0/0
+  # Web server
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow all HTTP traffic
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: TCP
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Sub ${SshAllowCidrIp}
+      VpcId: !Ref VPC
+  WebServerServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: WebServerServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !Sub ${CodePipelineBucket.Arn}/*
+                Action:
+                  - s3:Get*
+                  - s3:List*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebServerServiceRole
+  # Auto scaling
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0d728fd4e52be968f
+        InstanceType: t2.micro
+        NetworkInterfaces:
+          - DeviceIndex: "0"
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref WebServerSecurityGroup
+        KeyName: !Sub ${SshKeyName}
+        IamInstanceProfile:
+          Name: !Ref WebServerInstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -x
+            /opt/aws/bin/cfn-init -v \
+              --stack ${AWS::StackName} \
+              --resource WebServerLaunchTemplate \
+              --region ${AWS::Region} 
+            /opt/aws/bin/cfn-signal -e $? \
+              --stack ${AWS::StackName} \
+              --resource WebServerAutoScalingGroup \
+              --region ${AWS::Region}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - Install
+            - Configure
+            - Start
+        Install:
+          commands:
+            install:
+              command: !Sub |
+                yum update -y
+                yum install -y ruby wget amazon-cloudwatch-agent
+                amazon-linux-extras install -y nginx1
+                cd /home/ec2-user
+                wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+                chmod +x ./install
+                sudo ./install auto
+        Configure:
+          files:
+            /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json:
+              content: !Sub |
+                {
+                  "logs": {
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          { 
+                            "file_path": "/var/log/nginx/error.log", 
+                            "log_group_name": "${CloudWatchLogGroup}",
+                            "log_stream_name": "nginx"
+                          }, { 
+                            "file_path": "/var/log/aws/codedeploy-agent/codedeploy-agent.log", 
+                            "log_group_name": "${CloudWatchLogGroup}",
+                            "log_stream_name": "codedeploy-agent"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+        Start:
+          commands:
+            start:
+              command: |
+                systemctl enable nginx
+                systemctl start nginx
+                /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    DependsOn: InternetRoute
+  WebServerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+  WebServerLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+  WebServerLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebServerLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerLoadBalancerTargetGroup
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        Version: !Sub ${WebServerLaunchTemplate.LatestVersionNumber}
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+      MinSize: 1
+      MaxSize: 2
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      TargetGroupARNs:
+        - !Ref WebServerLoadBalancerTargetGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+  # Cloud watch
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 3
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 3
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck20150319
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${CloudTrailBucket}
+          - Sid: AWSCloudTrailWrite20150319
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${CloudTrailBucket}/AWSLogs/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+  CloudTrailServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !Sub ${CloudWatchLogGroup.Arn}
+                Action: logs:*
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      IsLogging: true
+      S3BucketName: !Ref CloudTrailBucket
+      CloudWatchLogsLogGroupArn: !Sub ${CloudWatchLogGroup.Arn}
+      CloudWatchLogsRoleArn: !Sub ${CloudTrailServiceRole.Arn}
+  # Code pipeline
+  CodePipelineBucket:
+    Type: AWS::S3::Bucket
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !Sub ${CodePipelineBucket.Arn}/*
+                Action: s3:*
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !Ref CodeBuildServiceRole
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        ComputeType: BUILD_GENERAL1_SMALL
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - cd write-it-down-web
+                - npm install
+                - npm run build
+                - mkdir scripts
+                - |
+                    cat > scripts/before_install.sh <<EOF
+                    #!/bin/bash
+                    rm -rf /usr/share/nginx/html/*
+                    EOF
+                - |
+                    cat > appspec.yml <<EOF
+                    version: 0.0
+                    os: linux
+                    files:
+                      - source: build
+                        destination: /usr/share/nginx/html
+                    hooks:
+                      BeforeInstall:
+                        - location: scripts/before_install.sh
+                    EOF
+          artifacts:
+            files:
+              - appspec.yml
+              - build/**/*
+              - scripts/**/*
+            base-directory: write-it-down-web
+      LogsConfig:
+        CloudWatchLogs:
+          Status: DISABLED
+        S3Logs:
+          Status: ENABLED
+          Location: !Sub ${CodePipelineBucket.Arn}/BuildLogs
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CodeDeployServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Resource:
+                  - arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/CodeDeployTestAPICall
+                  - !Sub arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/${WebServerAutoScalingGroup}
+                Action: autoscaling:*
+                Effect: Allow
+              - Resource: "*"
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/aws:autoscaling:groupName: !Ref WebServerAutoScalingGroup
+                Action: ec2:*
+                Effect: Allow
+              - Resource: !Ref WebServerLoadBalancerTargetGroup
+                Action: elasticloadbalancing:*
+                Effect: Allow
+              - Resource: !Sub ${CodePipelineBucket.Arn}/*
+                Action: s3:*
+                Effect: Allow
+              - Resource: "*"
+                Action:
+                  - autoscaling:Describe*
+                  - ec2:Describe*
+                  - elasticloadbalancing:Describe*
+                Effect: Allow
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ComputePlatform: Server
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      ServiceRoleArn: !Sub ${CodeDeployServiceRole.Arn}
+      AutoScalingGroups:
+        - !Ref WebServerAutoScalingGroup
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !Sub ${WebServerLoadBalancerTargetGroup.TargetGroupName}
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      DeploymentStyle:
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+        DeploymentType: IN_PLACE
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Resource: !Sub ${SourceCodeConnectionArn}
+                Action: codestar-connections:UseConnection
+                Effect: Allow
+              - Resource: !Sub ${CodePipelineBucket.Arn}/*
+                Action: s3:*
+                Effect: Allow
+              - Resource: !Sub ${CodeBuildProject.Arn}
+                Action: codebuild:*
+                Effect: Allow
+              - Resource:
+                  - !Sub arn:aws:codedeploy:*:*:application:${CodeDeployApplication}
+                  - !Sub arn:aws:codedeploy:*:*:deploymentgroup:${CodeDeployApplication}/${CodeDeployDeploymentGroup}
+                  - arn:aws:codedeploy:*:*:deploymentconfig:CodeDeployDefault.*
+                Action: codedeploy:*
+                Effect: Allow
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !Sub ${CodePipelineServiceRole.Arn}
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineBucket
+      RestartExecutionOnUpdate: true
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Default
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ConnectionArn: !Sub ${SourceCodeConnectionArn}
+                FullRepositoryId: !Sub ${SourceCodeRepository}
+                BranchName: master
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Build
+          Actions:
+            - Name: Default
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+        - Name: Deploy
+          Actions:
+            - Name: Default
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: "1"
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+Parameters:
+  SshAllowCidrIp:
+    Type: String
+    Default: 0.0.0.0/0
+  SshKeyName:
+    Type: String
+    Default: chimin
+  SourceCodeConnectionArn:
+    Type: String
+    Default: arn:aws:codestar-connections:ap-southeast-1:658240618267:connection/3d22818a-be97-4fbb-9ca4-aaf97eab4612
+  SourceCodeRepository:
+    Type: String
+    Default: chimin/write-it-down
+Outputs:
+  Url:
+    Description: URL of the web server instance
+    Value: !Sub http://${WebServerLoadBalancer.DNSName}

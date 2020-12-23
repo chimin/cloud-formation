@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  # VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  VPCInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: ap-southeast-1a
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: ap-southeast-1b
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+  InternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      GatewayId: !Ref InternetGateway
+      DestinationCidrBlock: 0.0.0.0/0
+  # Web server
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow all HTTP traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: TCP
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Sub ${SshAllowCidrIp}
+  WebServerServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebServerServiceRole
+  # Auto scaling
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0d728fd4e52be968f
+        InstanceType: t2.micro
+        NetworkInterfaces:
+          - DeviceIndex: "0"
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref WebServerSecurityGroup
+        KeyName: !Sub ${SshKeyName}
+        IamInstanceProfile:
+          Name: !Ref WebServerInstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -x
+            /opt/aws/bin/cfn-init -v \
+              --stack ${AWS::StackName} \
+              --resource WebServerLaunchTemplate \
+              --region ${AWS::Region} 
+            /opt/aws/bin/cfn-signal -e $? \
+              --stack ${AWS::StackName} \
+              --resource WebServerAutoScalingGroup \
+              --region ${AWS::Region}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - Install
+            - Configure
+            - Start
+        Install:
+          commands:
+            install:
+              command: !Sub |
+                yum update -y
+                yum install -y ruby wget amazon-cloudwatch-agent
+                amazon-linux-extras install -y nginx1
+                cd /home/ec2-user
+                wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+                chmod +x ./install
+                sudo ./install auto
+        Configure:
+          files:
+            /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json:
+              content: !Sub |
+                {
+                  "logs": {
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          { 
+                            "file_path": "/var/log/nginx/error.log", 
+                            "log_group_name": "${CloudWatchLogGroup}",
+                            "log_stream_name": "nginx"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+        Start:
+          commands:
+            start:
+              command: |
+                systemctl enable nginx
+                systemctl start nginx
+                /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    DependsOn: InternetRoute
+  WebServerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+  WebServerLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+  WebServerLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebServerLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerLoadBalancerTargetGroup
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        Version: !Sub ${WebServerLaunchTemplate.LatestVersionNumber}
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+      MinSize: 1
+      MaxSize: 2
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      TargetGroupARNs:
+        - !Ref WebServerLoadBalancerTargetGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+  # Cloud watch
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 3
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 3
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck20150319
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${CloudTrailBucket}
+          - Sid: AWSCloudTrailWrite20150319
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${CloudTrailBucket}/AWSLogs/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+  CloudTrailServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !Sub ${CloudWatchLogGroup.Arn}
+                Action: logs:*
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      IsLogging: true
+      S3BucketName: !Ref CloudTrailBucket
+      CloudWatchLogsLogGroupArn: !Sub ${CloudWatchLogGroup.Arn}
+      CloudWatchLogsRoleArn: !Sub ${CloudTrailServiceRole.Arn}
+Parameters:
+  SshAllowCidrIp:
+    Type: String
+    Default: 0.0.0.0/0
+  SshKeyName:
+    Type: String
+    Default: chimin
+Outputs:
+  Url:
+    Description: URL of the web server instance
+    Value: !Sub http://${WebServerLoadBalancer.DNSName}
